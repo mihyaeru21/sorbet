@@ -302,6 +302,36 @@ private:
 
     static const int MAX_SUGGESTION_COUNT = 10;
 
+    static void stubForRbiGeneration(core::MutableContext ctx, const Nesting *scope, ast::ConstantLit *out) {
+        if (out->symbol.exists()) {
+            return;
+        }
+
+        core::ClassOrModuleRef owner;
+
+        // if the scope of the constant lit is non-empty, attempt to resolve that first to help determine the owner.
+        auto &original = ast::cast_tree_nonnull<ast::UnresolvedConstantLit>(out->original);
+        if (auto *origScope = ast::cast_tree<ast::ConstantLit>(original.scope)) {
+            stubForRbiGeneration(ctx, scope, origScope);
+            owner = origScope->symbol.asClassOrModuleRef();
+        }
+
+        if (!owner.exists()) {
+            // TODO: loop over scopes to handle nested packages that are parents of the current one
+
+            owner = core::Symbols::root();
+        }
+
+        // TODO: probably wrong file here
+        auto symbol = ctx.state.enterClassSymbol({ctx.file, out->loc}, owner,
+                                                 ast::cast_tree<ast::UnresolvedConstantLit>(out->original)->cnst);
+
+        // force a singleton into existence
+        symbol.data(ctx)->singletonClass(ctx);
+
+        out->symbol = symbol;
+    }
+
     // We have failed to resolve the constant. We'll need to report the error and stub it so that we can proceed
     static void constantResolutionFailed(core::MutableContext ctx, ResolutionItem &job, int &suggestionCount) {
         auto &original = ast::cast_tree_nonnull<ast::UnresolvedConstantLit>(job.out->original);
@@ -328,6 +358,13 @@ private:
             job.out->symbol = core::Symbols::untyped();
             return;
         }
+
+        // When generating rbis in single-package mode, we may need to invent a symbol at this point
+        if (ctx.state.singlePackage) {
+            stubForRbiGeneration(ctx, job.scope.get(), job.out);
+            return;
+        }
+
         ENFORCE(!resolved.exists());
         ENFORCE(!job.out->symbol.exists());
 
@@ -422,6 +459,7 @@ private:
             }
             nesting = nesting->parent;
         }
+
         return false;
     }
 
@@ -579,6 +617,11 @@ private:
             core::make_type<core::UnresolvedClassType>(unresolvedPath->first, move(unresolvedPath->second));
 
         auto uaSym = ctx.state.enterMethodSymbol(core::Loc::none(), item.klass, core::Names::unresolvedAncestors());
+
+        // add a fake block argument so that this method symbol passes sanity checks
+        auto &arg = ctx.state.enterMethodArgumentSymbol(core::Loc::none(), uaSym, core::Names::blkArg());
+        arg.flags.isBlock = true;
+
         core::TypePtr resultType = uaSym.data(ctx)->resultType;
         if (!resultType) {
             uaSym.data(ctx)->resultType = core::make_type<core::TupleType>(vector<core::TypePtr>{ancestorType});

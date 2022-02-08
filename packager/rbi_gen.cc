@@ -1,4 +1,5 @@
-#include "packager/rbi_gen.h"
+#include <algorithm> // for std::remove_if
+
 #include "absl/strings/match.h"
 #include "absl/strings/str_join.h"
 #include "absl/strings/str_replace.h"
@@ -7,8 +8,11 @@
 #include "common/FileOps.h"
 #include "common/concurrency/ConcurrentQueue.h"
 #include "common/concurrency/WorkerPool.h"
+#include "common/formatting.h"
+#include "common/sort.h"
 #include "core/GlobalState.h"
 #include "packager/packager.h"
+#include "packager/rbi_gen.h"
 
 using namespace std;
 namespace sorbet::packager {
@@ -1213,29 +1217,30 @@ public:
         return output;
     }
 };
+
 } // namespace
 
 UnorderedSet<core::ClassOrModuleRef> RBIGenerator::buildPackageNamespace(core::GlobalState &gs, WorkerPool &workers) {
     const auto &packageDB = gs.packageDB();
-
     auto &packages = packageDB.packages();
+
+    // TODO: should this be an enforce?
     if (packages.empty()) {
         Exception::raise("No packages found?");
     }
 
-    auto testNamespace = core::Names::Constants::Test();
-
     UnorderedSet<core::ClassOrModuleRef> packageNamespaces;
     for (auto package : packages) {
-        auto &pkg = gs.packageDB().getPackageInfo(package);
+        auto &pkg = packageDB.getPackageInfo(package);
         vector<core::NameRef> fullName = pkg.fullName();
+
         auto packageNamespace = lookupFQN(gs, fullName);
         // Might not exist if package has no files.
         if (packageNamespace.exists()) {
             packageNamespaces.insert(packageNamespace.asClassOrModuleRef());
         }
 
-        fullName.insert(fullName.begin(), testNamespace);
+        fullName.insert(fullName.begin(), core::Names::Constants::Test());
         auto testPackageNamespace = lookupFQN(gs, fullName);
         if (testPackageNamespace.exists()) {
             packageNamespaces.insert(testPackageNamespace.asClassOrModuleRef());
@@ -1287,5 +1292,74 @@ void RBIGenerator::run(core::GlobalState &gs, const UnorderedSet<core::ClassOrMo
             threadBarrier.DecrementCount();
         });
     threadBarrier.Wait();
+}
+
+namespace {
+
+struct SingleFileInfo {
+    core::NameRef name;
+    core::FileRef file;
+
+    struct Parent {
+        core::NameRef name;
+        core::FileRef file;
+
+        Parent(core::NameRef name, core::FileRef file) : name{name}, file{file} {}
+    };
+
+    std::vector<Parent> parents;
+
+    static SingleFileInfo make(core::GlobalState &gs, std::string packageName) {
+        SingleFileInfo res;
+
+        auto &packageDB = gs.packageDB();
+
+        for (auto pkg : packageDB.packages()) {
+            auto &info = packageDB.getPackageInfo(pkg);
+
+            auto thisName =
+                fmt::format("{}", fmt::map_join(info.fullName(), "::", [&gs](auto name) { return name.show(gs); }));
+
+            if (thisName == packageName) {
+                res.name = pkg;
+                res.file = info.definitionLoc().file();
+            } else if (thisName.size() < packageName.size() &&
+                       std::equal(thisName.begin(), thisName.end(), packageName.begin())) {
+                res.parents.emplace_back(pkg, info.definitionLoc().file());
+            }
+        }
+
+        return res;
+    }
+
+    bool neededForRBIGeneration(core::FileRef candidate) const {
+        if (this->file == candidate) {
+            return true;
+        }
+
+        auto it = absl::c_find_if(this->parents, [candidate](auto &p) { return p.file == candidate; });
+
+        return it != this->parents.end();
+    }
+};
+
+} // namespace
+
+void RBIGenerator::runSinglePackage(core::GlobalState &gs,
+                                    const UnorderedSet<core::ClassOrModuleRef> &packageNamespaces, string packageName,
+                                    string outputDir, WorkerPool &workers) {
+    auto singleFileInfo = SingleFileInfo::make(gs, packageName);
+
+    auto output = runOnce(gs, singleFileInfo.name, packageNamespaces);
+    if (!output.rbi.empty()) {
+        FileOps::write(absl::StrCat(outputDir, "/", output.baseFilePath, ".package.rbi"), output.rbi);
+        FileOps::write(absl::StrCat(outputDir, "/", output.baseFilePath, ".deps.json"), output.rbiPackageDependencies);
+    }
+
+    if (!output.testRBI.empty()) {
+        FileOps::write(absl::StrCat(outputDir, "/", output.baseFilePath, ".test.package.rbi"), output.testRBI);
+        FileOps::write(absl::StrCat(outputDir, "/", output.baseFilePath, ".test.deps.json"),
+                       output.testRBIPackageDependencies);
+    }
 }
 } // namespace sorbet::packager
