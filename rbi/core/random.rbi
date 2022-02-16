@@ -28,7 +28,7 @@
 #
 # PRNGs are currently implemented as a modified Mersenne Twister with a period
 # of 2\*\*19937-1.
-class Random < Object
+class Random < Random::Base
   include Random::Formatter
   extend Random::Formatter
 
